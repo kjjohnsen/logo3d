@@ -321,9 +321,9 @@ def api_threshold():
     )
 
 
-@app.route('/api/toggle_region', methods=['POST'])
-def api_toggle_region():
-    """Click a point to flood-fill toggle that region in the mask."""
+@app.route('/api/paint', methods=['POST'])
+def api_paint():
+    """Paint a brush circle to force-keep or force-remove at a point."""
     d = request.json
     sid = d.get('id')
     if sid not in sessions:
@@ -334,17 +334,25 @@ def api_toggle_region():
     img = decode_image(sess['img_bytes'])
     h, w = img.shape[:2]
 
-    # Get or create the manual overrides mask
     if 'manual_mask' not in sess:
         sess['manual_mask'] = np.zeros((h, w), dtype=np.uint8)
 
-    # Click position (0-100 percentage)
+    # Percentage coords and brush size
     px = int(d.get('x', 50) * w / 100)
     py = int(d.get('y', 50) * h / 100)
     px = max(0, min(w - 1, px))
     py = max(0, min(h - 1, py))
+    brush = max(3, int(d.get('brush', 5) * max(w, h) / 100))
+    mode = d.get('mode', 'keep')  # 'keep', 'remove', or 'clear'
 
-    # Build current mask
+    if mode == 'clear':
+        cv2.circle(sess['manual_mask'], (px, py), brush, 0, -1)
+    elif mode == 'remove':
+        cv2.circle(sess['manual_mask'], (px, py), brush, 2, -1)
+    else:
+        cv2.circle(sess['manual_mask'], (px, py), brush, 1, -1)
+
+    # Rebuild mask with overrides
     method = d.get('method', 'color')
     sensitivity = float(d.get('sensitivity', 1.0))
     erode_px = int(d.get('erode', -1))
@@ -358,53 +366,41 @@ def api_toggle_region():
         cache_key = f'ai_alpha_{ai_model}'
         if cache_key not in sess:
             sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
-        raw_alpha = sess[cache_key]
-        base_mask = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
+        base_mask = apply_ai_mask(sess[cache_key], alpha_thresh, erode_px, dilate_px)
     else:
         img_up, scale = upscale_image(img)
-        thresh = extract_mask(img_up, sensitivity, erode_px)
+        base_mask = extract_mask(img_up, sensitivity, erode_px)
         if scale > 1:
-            base_mask = cv2.resize(thresh, (w, h), interpolation=cv2.INTER_NEAREST)
-        else:
-            base_mask = thresh
+            base_mask = cv2.resize(base_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    # Apply existing manual overrides
-    combined = base_mask.copy()
-    combined[sess['manual_mask'] == 1] = 255  # forced keep
-    combined[sess['manual_mask'] == 2] = 0    # forced remove
+    final = apply_manual_overrides(base_mask, sess, w, h)
 
-    # Check what the clicked pixel currently is
-    is_fg = combined[py, px] > 0
-
-    # Flood fill on the base mask to find the connected region
-    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    if is_fg:
-        # Currently foreground — mark region as remove
-        cv2.floodFill(combined, flood_mask, (px, py), 0, 10, 10, cv2.FLOODFILL_MASK_ONLY)
-        region = flood_mask[1:-1, 1:-1] > 0
-        sess['manual_mask'][region] = 2  # force remove
-    else:
-        # Currently background — mark region as keep
-        inv = 255 - combined
-        cv2.floodFill(inv, flood_mask, (px, py), 0, 10, 10, cv2.FLOODFILL_MASK_ONLY)
-        region = flood_mask[1:-1, 1:-1] > 0
-        sess['manual_mask'][region] = 1  # force keep
-
-    # Rebuild final mask with overrides
-    final = base_mask.copy()
-    final[sess['manual_mask'] == 1] = 255
-    final[sess['manual_mask'] == 2] = 0
-
-    # Overlay
     overlay = img.copy()
     removed = final == 0
     overlay[removed] = (overlay[removed] * 0.3 + np.array([0, 0, 180]) * 0.7).astype(np.uint8)
+    # Show brush dots: green for keep, red for remove
+    mm = sess['manual_mask']
+    overlay[mm == 1] = (overlay[mm == 1] * 0.5 + np.array([0, 200, 0]) * 0.5).astype(np.uint8)
+    overlay[mm == 2] = (overlay[mm == 2] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+
     fg_pct = (final > 0).sum() / (w * h) * 100
 
     return jsonify(
         preview=f'data:image/png;base64,{img_to_b64png(overlay)}',
         fg_pct=round(fg_pct, 1),
     )
+
+
+@app.route('/api/clear_paint', methods=['POST'])
+def api_clear_paint():
+    """Clear all manual paint overrides."""
+    d = request.json
+    sid = d.get('id')
+    if sid not in sessions:
+        return jsonify(error='Session expired'), 404
+    sess = sessions[sid]
+    sess['manual_mask'] = np.zeros_like(sess.get('manual_mask', np.zeros((1, 1), dtype=np.uint8)))
+    return jsonify(ok=True)
 
 
 @app.route('/api/contours', methods=['POST'])
@@ -559,7 +555,9 @@ header p { color: #888; font-size: 0.9rem; margin-top: 4px; }
 .main { display: flex; gap: 20px; padding: 0 20px 20px; height: calc(100vh - 110px); }
 .preview-pane { flex: 1; display: flex; align-items: center; justify-content: center;
                 background: #151520; border-radius: 12px; overflow: hidden; position: relative; min-width: 0; }
-.preview-pane img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.preview-pane img { max-width: 100%; max-height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+.preview-pane.paint-mode { cursor: crosshair; }
+.preview-pane.paint-mode img { pointer-events: none; }
 .preview-pane iframe { width: 100%; height: 100%; border: none; }
 
 .controls { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
@@ -671,7 +669,17 @@ input[type=range] { width: 100%; accent-color: #4a9; }
             </div>
             <label class="slider-label">Erosion <span id="erodeVal">auto</span></label>
             <input type="range" id="erode" min="-1" max="20" step="1" value="-1">
-            <p class="hint" id="clickHint" style="display:none;margin-top:4px;color:#6b8">Click on the preview to toggle keep/remove regions</p>
+            <div id="paintControls" style="margin-top:6px">
+                <label class="slider-label" style="margin-bottom:2px">Paint Mode</label>
+                <div class="method-toggle">
+                    <button class="btn method-btn paint-btn active" data-mode="keep" id="paintKeep" style="background:#186818;border-color:#186818">+ Keep</button>
+                    <button class="btn method-btn paint-btn" data-mode="remove" id="paintRemove">- Remove</button>
+                    <button class="btn method-btn paint-btn" data-mode="clear" id="paintClear">Erase</button>
+                </div>
+                <label class="slider-label">Brush Size <span id="brushVal">5</span></label>
+                <input type="range" id="brushSize" min="1" max="15" step="1" value="5">
+                <button class="btn btn-secondary" id="btnClearPaint" style="width:100%;font-size:0.75rem;padding:4px">Reset All Paint</button>
+            </div>
             <div class="stat" id="fgStat"></div>
             <div class="spinner" id="threshSpinner">Updating...</div>
             <div class="btn-row">
@@ -722,6 +730,7 @@ function setStep(n) {
         d.classList.toggle('active', i === n);
         d.classList.toggle('done', i < n);
     });
+    $('#previewPane').classList.toggle('paint-mode', n === 1);
 }
 
 // ── Upload ──
@@ -923,27 +932,76 @@ function debounceFetch(fn) {
     debounceTimer = setTimeout(fn, 300);
 }
 
-// ── Click-to-toggle mask regions ──
-$('#previewPane').addEventListener('click', async (e) => {
-    if (state.step !== 1) return;
-    const img = $('#previewPane img');
-    if (!img) return;
+// ── Paint keep/remove regions ──
 
-    // Get click coords relative to actual image
+state.paintMode = 'keep';
+state.painting = false;
+
+document.querySelectorAll('.paint-btn').forEach(b => {
+    b.onclick = () => {
+        state.paintMode = b.dataset.mode;
+        document.querySelectorAll('.paint-btn').forEach(pb => pb.classList.remove('active'));
+        b.classList.add('active');
+        // Style active button
+        document.querySelectorAll('.paint-btn').forEach(pb => {
+            pb.style.background = ''; pb.style.borderColor = '';
+        });
+        if (b.dataset.mode === 'keep') { b.style.background = '#186818'; b.style.borderColor = '#186818'; }
+        else if (b.dataset.mode === 'remove') { b.style.background = '#881818'; b.style.borderColor = '#881818'; }
+        else { b.style.background = '#555'; b.style.borderColor = '#555'; }
+    };
+});
+
+$('#brushSize').oninput = () => { $('#brushVal').textContent = $('#brushSize').value; };
+
+$('#btnClearPaint').onclick = async () => {
+    await fetch('/api/clear_paint', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ id: state.id })
+    });
+    fetchThreshold();
+};
+
+function getPaintCoords(e) {
+    const img = $('#previewPane img');
+    if (!img) return null;
     const rect = img.getBoundingClientRect();
     const x = Math.round((e.clientX - rect.left) / rect.width * 100);
     const y = Math.round((e.clientY - rect.top) / rect.height * 100);
-    if (x < 0 || x > 100 || y < 0 || y > 100) return;
+    if (x < 0 || x > 100 || y < 0 || y > 100) return null;
+    return { x, y };
+}
 
-    const r = await fetch('/api/toggle_region', {
+async function paintAt(e) {
+    if (state.step !== 1) return;
+    const coords = getPaintCoords(e);
+    if (!coords) return;
+
+    const r = await fetch('/api/paint', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ id: state.id, x, y, ...getParams() })
+        body: JSON.stringify({
+            ...coords,
+            mode: state.paintMode,
+            brush: parseInt($('#brushSize').value),
+            ...getParams(),
+        })
     });
     const d = await r.json();
     if (d.error) return;
     showPreview(d.preview);
     $('#fgStat').textContent = `Foreground: ${d.fg_pct}% of image`;
+}
+
+$('#previewPane').addEventListener('mousedown', (e) => {
+    if (state.step !== 1) return;
+    state.painting = true;
+    paintAt(e);
 });
+$('#previewPane').addEventListener('mousemove', (e) => {
+    if (!state.painting) return;
+    paintAt(e);
+});
+document.addEventListener('mouseup', () => { state.painting = false; });
 </script>
 </body>
 </html>'''
