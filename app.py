@@ -8,14 +8,6 @@ import json
 import base64
 import os
 import uuid
-from PIL import Image
-import io
-
-try:
-    from rembg import remove as rembg_remove
-    HAS_REMBG = True
-except ImportError:
-    HAS_REMBG = False
 import time
 import threading
 
@@ -23,7 +15,6 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 # In-memory session store: {id: {img_bytes, filename, timestamp}}
-# Note: with multiple gunicorn workers, use --preload or -w 1 to share memory
 sessions = {}
 SESSION_TTL = 1800  # 30 minutes
 
@@ -87,32 +78,6 @@ def upscale_image(img):
     if scale > 1:
         img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
     return img, scale
-
-
-AI_MODELS = ['u2net', 'isnet-general-use', 'silueta', 'u2netp', 'isnet-anime']
-
-
-def extract_mask_ai_raw(img_orig, model='u2net'):
-    """Use rembg to get the raw soft alpha mask (0-255). Cached per session+model."""
-    if not HAS_REMBG:
-        raise RuntimeError("rembg not installed")
-    from rembg import new_session
-    sess = new_session(model)
-    pil_img = Image.fromarray(cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB))
-    result = rembg_remove(pil_img, session=sess)
-    return np.array(result)[:, :, 3]  # soft alpha 0-255
-
-
-def apply_ai_mask(raw_alpha, alpha_thresh=127, erode_px=None, dilate_px=None):
-    """Apply threshold + morphology to a raw soft alpha mask."""
-    _, mask = cv2.threshold(raw_alpha, int(alpha_thresh), 255, cv2.THRESH_BINARY)
-    if dilate_px and dilate_px > 0:
-        dk = np.ones((dilate_px * 2 + 1, dilate_px * 2 + 1), np.uint8)
-        mask = cv2.dilate(mask, dk, iterations=1)
-    if erode_px and erode_px > 0:
-        ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
-        mask = cv2.erode(mask, ek, iterations=1)
-    return mask
 
 
 def extract_mask(img_up, sensitivity=1.0, erode_px=None):
@@ -222,19 +187,6 @@ def img_to_b64png(img):
     return base64.b64encode(buf).decode()
 
 
-def apply_manual_overrides(mask, sess, w, h):
-    """Apply manual keep/remove overrides to a mask."""
-    if 'manual_mask' not in sess:
-        return mask
-    mm = sess['manual_mask']
-    if mm.shape != (h, w):
-        return mask
-    result = mask.copy()
-    result[mm == 1] = 255  # forced keep
-    result[mm == 2] = 0    # forced remove
-    return result
-
-
 # ── Routes ──
 
 @app.route('/')
@@ -283,30 +235,19 @@ def api_threshold():
     img = decode_image(sess['img_bytes'])
     h, w = img.shape[:2]
 
-    method = d.get('method', 'color')
+    img_up, scale = upscale_image(img)
     sensitivity = float(d.get('sensitivity', 1.0))
     erode_px = int(d.get('erode', -1))
     if erode_px < 0:
         erode_px = None
-    dilate_px = int(d.get('dilate', 0))
-    alpha_thresh = int(d.get('alpha_thresh', 127))
-    ai_model = d.get('ai_model', 'u2net')
 
-    if method == 'ai':
-        # Cache raw alpha per session+model
-        cache_key = f'ai_alpha_{ai_model}'
-        if cache_key not in sess:
-            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
-        raw_alpha = sess[cache_key]
-        mask_small = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
+    thresh = extract_mask(img_up, sensitivity, erode_px)
+
+    # Downscale mask for preview
+    if scale > 1:
+        mask_small = cv2.resize(thresh, (w, h), interpolation=cv2.INTER_NEAREST)
     else:
-        img_up, scale = upscale_image(img)
-        thresh = extract_mask(img_up, sensitivity, erode_px)
-        if scale > 1:
-            mask_small = cv2.resize(thresh, (w, h), interpolation=cv2.INTER_NEAREST)
-        else:
-            mask_small = thresh
-        thresh_for_contours = thresh
+        mask_small = thresh
 
     # Overlay: red tint on removed areas (where mask is 0)
     overlay = img.copy()
@@ -321,123 +262,6 @@ def api_threshold():
     )
 
 
-@app.route('/api/paint', methods=['POST'])
-def api_paint():
-    """Paint a brush circle to force-keep or force-remove at a point."""
-    d = request.json
-    sid = d.get('id')
-    if sid not in sessions:
-        return jsonify(error='Session expired'), 404
-
-    sess = sessions[sid]
-    sess['timestamp'] = time.time()
-    img = decode_image(sess['img_bytes'])
-    h, w = img.shape[:2]
-
-    if 'manual_mask' not in sess:
-        sess['manual_mask'] = np.zeros((h, w), dtype=np.uint8)
-
-    # Percentage coords and brush size
-    px = int(d.get('x', 50) * w / 100)
-    py = int(d.get('y', 50) * h / 100)
-    px = max(0, min(w - 1, px))
-    py = max(0, min(h - 1, py))
-    brush = max(3, int(d.get('brush', 5) * max(w, h) / 100))
-    mode = d.get('mode', 'keep')  # 'keep', 'remove', or 'clear'
-
-    if mode == 'clear':
-        cv2.circle(sess['manual_mask'], (px, py), brush, 0, -1)
-    elif mode == 'remove':
-        cv2.circle(sess['manual_mask'], (px, py), brush, 2, -1)
-    else:
-        cv2.circle(sess['manual_mask'], (px, py), brush, 1, -1)
-
-    # Rebuild mask with overrides
-    method = d.get('method', 'color')
-    sensitivity = float(d.get('sensitivity', 1.0))
-    erode_px = int(d.get('erode', -1))
-    if erode_px < 0:
-        erode_px = None
-    dilate_px = int(d.get('dilate', 0))
-    alpha_thresh = int(d.get('alpha_thresh', 127))
-    ai_model = d.get('ai_model', 'u2net')
-
-    if method == 'ai':
-        cache_key = f'ai_alpha_{ai_model}'
-        if cache_key not in sess:
-            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
-        base_mask = apply_ai_mask(sess[cache_key], alpha_thresh, erode_px, dilate_px)
-    else:
-        img_up, scale = upscale_image(img)
-        base_mask = extract_mask(img_up, sensitivity, erode_px)
-        if scale > 1:
-            base_mask = cv2.resize(base_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    final = apply_manual_overrides(base_mask, sess, w, h)
-
-    overlay = img.copy()
-    removed = final == 0
-    overlay[removed] = (overlay[removed] * 0.3 + np.array([0, 0, 180]) * 0.7).astype(np.uint8)
-    # Show brush dots: green for keep, red for remove
-    mm = sess['manual_mask']
-    overlay[mm == 1] = (overlay[mm == 1] * 0.5 + np.array([0, 200, 0]) * 0.5).astype(np.uint8)
-    overlay[mm == 2] = (overlay[mm == 2] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
-
-    fg_pct = (final > 0).sum() / (w * h) * 100
-
-    return jsonify(
-        preview=f'data:image/png;base64,{img_to_b64png(overlay)}',
-        fg_pct=round(fg_pct, 1),
-    )
-
-
-@app.route('/api/clear_paint', methods=['POST'])
-def api_clear_paint():
-    """Clear all manual paint overrides."""
-    d = request.json
-    sid = d.get('id')
-    if sid not in sessions:
-        return jsonify(error='Session expired'), 404
-    sess = sessions[sid]
-    sess['manual_mask'] = np.zeros_like(sess.get('manual_mask', np.zeros((1, 1), dtype=np.uint8)))
-    return jsonify(ok=True)
-
-
-@app.route('/api/upload_mask', methods=['POST'])
-def api_upload_mask():
-    """Accept a client-generated mask (from SAM2) as base64 PNG."""
-    d = request.json
-    sid = d.get('id')
-    if sid not in sessions:
-        return jsonify(error='Session expired'), 404
-
-    sess = sessions[sid]
-    sess['timestamp'] = time.time()
-    img = decode_image(sess['img_bytes'])
-    h, w = img.shape[:2]
-
-    mask_b64 = d.get('mask', '')
-    if not mask_b64:
-        return jsonify(error='No mask data'), 400
-
-    # Decode mask from base64 PNG
-    mask_bytes = base64.b64decode(mask_b64)
-    mask_arr = np.frombuffer(mask_bytes, np.uint8)
-    mask_img = cv2.imdecode(mask_arr, cv2.IMREAD_GRAYSCALE)
-    if mask_img is None:
-        return jsonify(error='Could not decode mask'), 400
-
-    # Resize to match original image if needed
-    if mask_img.shape != (h, w):
-        mask_img = cv2.resize(mask_img, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    _, mask_bin = cv2.threshold(mask_img, 127, 255, cv2.THRESH_BINARY)
-    sess['sam_mask'] = mask_bin
-
-    fg_pct = (mask_bin > 0).sum() / (w * h) * 100
-    return jsonify(ok=True, fg_pct=round(fg_pct, 1))
-
-
 @app.route('/api/contours', methods=['POST'])
 def api_contours():
     d = request.json
@@ -450,34 +274,14 @@ def api_contours():
     img = decode_image(sess['img_bytes'])
     h, w = img.shape[:2]
 
-    method = d.get('method', 'color')
+    img_up, scale = upscale_image(img)
     sensitivity = float(d.get('sensitivity', 1.0))
     erode_px = int(d.get('erode', -1))
     if erode_px < 0:
         erode_px = None
     budget = int(d.get('budget', 600))
 
-    dilate_px = int(d.get('dilate', 0))
-    alpha_thresh = int(d.get('alpha_thresh', 127))
-    ai_model = d.get('ai_model', 'u2net')
-
-    if method == 'sam':
-        if 'sam_mask' not in sess:
-            return jsonify(error='No SAM mask uploaded'), 400
-        thresh = sess['sam_mask']
-        scale = 1
-    elif method == 'ai':
-        cache_key = f'ai_alpha_{ai_model}'
-        if cache_key not in sess:
-            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
-        raw_alpha = sess[cache_key]
-        thresh = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
-        thresh = apply_manual_overrides(thresh, sess, w, h)
-        scale = 1
-    else:
-        img_up, scale = upscale_image(img)
-        thresh = extract_mask(img_up, sensitivity, erode_px)
-
+    thresh = extract_mask(img_up, sensitivity, erode_px)
     simplified, hier = extract_contours(thresh, scale, budget)
 
     if not simplified:
@@ -514,7 +318,7 @@ def api_generate():
     img = decode_image(sess['img_bytes'])
     h, w = img.shape[:2]
 
-    method = d.get('method', 'color')
+    img_up, scale = upscale_image(img)
     sensitivity = float(d.get('sensitivity', 1.0))
     erode_px = int(d.get('erode', -1))
     if erode_px < 0:
@@ -522,27 +326,7 @@ def api_generate():
     budget = int(d.get('budget', 600))
     depth_pct = float(d.get('depth_pct', 8))
 
-    dilate_px = int(d.get('dilate', 0))
-    alpha_thresh = int(d.get('alpha_thresh', 127))
-    ai_model = d.get('ai_model', 'u2net')
-
-    if method == 'sam':
-        if 'sam_mask' not in sess:
-            return jsonify(error='No SAM mask uploaded'), 400
-        thresh = sess['sam_mask']
-        scale = 1
-    elif method == 'ai':
-        cache_key = f'ai_alpha_{ai_model}'
-        if cache_key not in sess:
-            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
-        raw_alpha = sess[cache_key]
-        thresh = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
-        thresh = apply_manual_overrides(thresh, sess, w, h)
-        scale = 1
-    else:
-        img_up, scale = upscale_image(img)
-        thresh = extract_mask(img_up, sensitivity, erode_px)
-
+    thresh = extract_mask(img_up, sensitivity, erode_px)
     simplified, hier = extract_contours(thresh, scale, budget)
     if not simplified:
         return jsonify(error='No contours found'), 400
@@ -600,10 +384,7 @@ header p { color: #888; font-size: 0.9rem; margin-top: 4px; }
 .main { display: flex; gap: 20px; padding: 0 20px 20px; height: calc(100vh - 110px); }
 .preview-pane { flex: 1; display: flex; align-items: center; justify-content: center;
                 background: #151520; border-radius: 12px; overflow: hidden; position: relative; min-width: 0; }
-.preview-pane img { max-width: 100%; max-height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
-.preview-pane.paint-mode { cursor: crosshair; }
-.preview-pane.paint-mode img { pointer-events: none; }
-.sam-overlay { position: absolute; pointer-events: none; }
+.preview-pane img { max-width: 100%; max-height: 100%; object-fit: contain; }
 .preview-pane iframe { width: 100%; height: 100%; border: none; }
 
 .controls { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
@@ -639,14 +420,6 @@ input[type=range] { width: 100%; accent-color: #4a9; }
 
 .spinner { display: none; text-align: center; color: #888; font-size: 0.85rem; padding: 8px; }
 .spinner.show { display: block; }
-
-.method-toggle { display: flex; gap: 4px; margin-bottom: 4px; }
-.method-btn { flex: 1; padding: 6px 8px; font-size: 0.8rem; background: #333; color: #aaa;
-              border: 1px solid #444; transition: all 0.2s; }
-.method-btn.active { background: #2a6; color: #fff; border-color: #2a6; }
-
-.select-input { width: 100%; padding: 6px 8px; background: #222; color: #ddd; border: 1px solid #444;
-                border-radius: 4px; font-size: 0.85rem; margin-bottom: 8px; }
 
 /* Mobile */
 @media (max-width: 768px) {
@@ -691,51 +464,10 @@ input[type=range] { width: 100%; accent-color: #4a9; }
         <div class="panel" id="step1">
             <h2>2. Background Removal</h2>
             <p class="hint">Red = removed area. Adjust until only the logo is white.</p>
-            <div class="method-toggle">
-                <button class="btn method-btn active" data-method="color" id="methodColor">Color</button>
-                <button class="btn method-btn" data-method="ai" id="methodAI">U2Net</button>
-                <button class="btn method-btn" data-method="sam" id="methodSAM">SAM 2 &#x2728;</button>
-            </div>
-            <div id="colorControls">
-                <label class="slider-label">Sensitivity <span id="sensVal">1.0</span></label>
-                <input type="range" id="sensitivity" min="0.3" max="2.0" step="0.05" value="1.0">
-            </div>
-            <div id="aiControls" style="display:none">
-                <label class="slider-label">Model</label>
-                <select id="aiModel" class="select-input">
-                    <option value="u2net">U2Net (general)</option>
-                    <option value="isnet-general-use">ISNet (general)</option>
-                    <option value="silueta">Silueta (fast)</option>
-                    <option value="u2netp">U2Net-P (light)</option>
-                    <option value="isnet-anime">ISNet (anime)</option>
-                </select>
-                <label class="slider-label">Alpha Cutoff <span id="alphaVal">127</span></label>
-                <input type="range" id="alphaThresh" min="10" max="245" step="5" value="127">
-                <label class="slider-label">Dilate <span id="dilateVal">0</span></label>
-                <input type="range" id="dilate" min="0" max="20" step="1" value="0">
-            </div>
+            <label class="slider-label">Sensitivity <span id="sensVal">1.0</span></label>
+            <input type="range" id="sensitivity" min="0.3" max="2.0" step="0.05" value="1.0">
             <label class="slider-label">Erosion <span id="erodeVal">auto</span></label>
             <input type="range" id="erode" min="-1" max="20" step="1" value="-1">
-            <div id="samControls" style="display:none">
-                <div class="spinner show" id="samLoadSpinner" style="display:none">Loading SAM 2 models (~165MB)...</div>
-                <p class="hint" id="samHint">Left-click = keep (green), Right-click = remove (red). Points refine the mask.</p>
-                <div class="method-toggle" style="margin-top:6px">
-                    <button class="btn method-btn active" id="samUndo" style="background:#555;border-color:#555">Undo Last</button>
-                    <button class="btn method-btn" id="samClear" style="background:#555;border-color:#555">Clear All</button>
-                </div>
-                <div class="stat" id="samStat"></div>
-            </div>
-            <div id="paintControls" style="margin-top:6px;display:none">
-                <label class="slider-label" style="margin-bottom:2px">Paint Mode</label>
-                <div class="method-toggle">
-                    <button class="btn method-btn paint-btn active" data-mode="keep" id="paintKeep" style="background:#186818;border-color:#186818">+ Keep</button>
-                    <button class="btn method-btn paint-btn" data-mode="remove" id="paintRemove">- Remove</button>
-                    <button class="btn method-btn paint-btn" data-mode="clear" id="paintClear">Erase</button>
-                </div>
-                <label class="slider-label">Brush Size <span id="brushVal">5</span></label>
-                <input type="range" id="brushSize" min="1" max="15" step="1" value="5">
-                <button class="btn btn-secondary" id="btnClearPaint" style="width:100%;font-size:0.75rem;padding:4px">Reset All Paint</button>
-            </div>
             <div class="stat" id="fgStat"></div>
             <div class="spinner" id="threshSpinner">Updating...</div>
             <div class="btn-row">
@@ -773,7 +505,7 @@ input[type=range] { width: 100%; accent-color: #4a9; }
 
 <script>
 const $ = s => document.querySelector(s);
-const state = { id: null, step: 0, method: 'color' };
+const state = { id: null, step: 0 };
 let debounceTimer = null;
 
 // ── Step management ──
@@ -786,7 +518,6 @@ function setStep(n) {
         d.classList.toggle('active', i === n);
         d.classList.toggle('done', i < n);
     });
-    $('#previewPane').classList.toggle('paint-mode', n === 1);
 }
 
 // ── Upload ──
@@ -815,11 +546,7 @@ $('#btnUploadNext').onclick = async () => {
     if (d.error) { alert(d.error); $('#btnUploadNext').disabled = false; return; }
 
     state.id = d.id;
-    state._origPreview = d.preview;
     showPreview(d.preview);
-    samEmbedding = null; // reset SAM on new upload
-    samPoints = [];
-    state._samMaskData = null;
     $('#btnUploadNext').textContent = 'Next';
     setStep(1);
     fetchThreshold();
@@ -831,7 +558,6 @@ function showPreview(src) {
     const img = document.createElement('img');
     img.src = src;
     pane.appendChild(img);
-    state._lastPreview = src;
 }
 
 function showViewer(html) {
@@ -842,32 +568,6 @@ function showViewer(html) {
     pane.appendChild(iframe);
     // Enable GLB download via message from iframe
     $('#btnDownload').disabled = false;
-}
-
-// ── Method toggle ──
-
-$('#methodColor').onclick = () => switchMethod('color');
-$('#methodAI').onclick = () => switchMethod('ai');
-$('#methodSAM').onclick = () => switchMethod('sam');
-
-function switchMethod(m) {
-    state.method = m;
-    document.querySelectorAll('.method-btn[data-method]').forEach(b =>
-        b.classList.toggle('active', b.dataset.method === m));
-    $('#colorControls').style.display = m === 'color' ? '' : 'none';
-    $('#aiControls').style.display = m === 'ai' ? '' : 'none';
-    $('#samControls').style.display = m === 'sam' ? '' : 'none';
-    $('#paintControls').style.display = (m === 'color' || m === 'ai') ? '' : 'none';
-    if (m === 'sam') {
-        // Show original image for SAM point-clicking
-        if (state._origPreview) showPreview(state._origPreview);
-        initSAM();
-    } else {
-        // Remove SAM overlay if switching away
-        const ov = $('#previewPane .sam-overlay');
-        if (ov) ov.remove();
-        fetchThreshold();
-    }
 }
 
 // ── Threshold ──
@@ -881,19 +581,6 @@ $('#erode').oninput = () => {
     $('#erodeVal').textContent = v < 0 ? 'auto' : v + 'px';
     debounceFetch(fetchThreshold);
 };
-$('#alphaThresh').oninput = () => {
-    $('#alphaVal').textContent = $('#alphaThresh').value;
-    debounceFetch(fetchThreshold);
-};
-$('#dilate').oninput = () => {
-    $('#dilateVal').textContent = $('#dilate').value;
-    debounceFetch(fetchThreshold);
-};
-$('#aiModel').onchange = () => {
-    $('#threshSpinner').classList.add('show');
-    $('#threshSpinner').textContent = 'Loading model...';
-    fetchThreshold();
-};
 
 async function fetchThreshold() {
     $('#threshSpinner').classList.add('show');
@@ -901,34 +588,19 @@ async function fetchThreshold() {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             id: state.id,
-            method: state.method,
             sensitivity: parseFloat($('#sensitivity').value),
             erode: parseInt($('#erode').value),
-            dilate: parseInt($('#dilate').value || 0),
-            alpha_thresh: parseInt($('#alphaThresh').value || 127),
-            ai_model: $('#aiModel').value,
         })
     });
     const d = await r.json();
     $('#threshSpinner').classList.remove('show');
-    $('#threshSpinner').textContent = 'Updating...';
     if (d.error) return;
     showPreview(d.preview);
     $('#fgStat').textContent = `Foreground: ${d.fg_pct}% of image`;
 }
 
 $('#btnThreshBack').onclick = () => setStep(0);
-$('#btnThreshNext').onclick = async () => {
-    if (state.method === 'sam') {
-        if (!state._samMaskData) { alert('Click on the image to create a mask first.'); return; }
-        $('#threshSpinner').classList.add('show');
-        $('#threshSpinner').textContent = 'Uploading mask...';
-        await uploadSAMMask();
-        $('#threshSpinner').classList.remove('show');
-    }
-    setStep(2);
-    fetchContours();
-};
+$('#btnThreshNext').onclick = () => { setStep(2); fetchContours(); };
 
 // ── Contours ──
 
@@ -941,7 +613,12 @@ async function fetchContours() {
     $('#contourSpinner').classList.add('show');
     const r = await fetch('/api/contours', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(getParams({budget: parseInt($('#budget').value)}))
+        body: JSON.stringify({
+            id: state.id,
+            sensitivity: parseFloat($('#sensitivity').value),
+            erode: parseInt($('#erode').value),
+            budget: parseInt($('#budget').value),
+        })
     });
     const d = await r.json();
     $('#contourSpinner').classList.remove('show');
@@ -966,10 +643,13 @@ async function fetchGenerate() {
     $('#btnDownload').disabled = true;
     const r = await fetch('/api/generate', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(getParams({
+        body: JSON.stringify({
+            id: state.id,
+            sensitivity: parseFloat($('#sensitivity').value),
+            erode: parseInt($('#erode').value),
             budget: parseInt($('#budget').value),
             depth_pct: parseFloat($('#depth').value),
-        }))
+        })
     });
     const d = await r.json();
     $('#genSpinner').classList.remove('show');
@@ -996,437 +676,10 @@ $('#btnStartOver').onclick = () => {
 
 // ── Utility ──
 
-function getParams(extra = {}) {
-    return {
-        id: state.id,
-        method: state.method,
-        sensitivity: parseFloat($('#sensitivity').value),
-        erode: parseInt($('#erode').value),
-        dilate: parseInt($('#dilate').value || 0),
-        alpha_thresh: parseInt($('#alphaThresh').value || 127),
-        ai_model: $('#aiModel').value,
-        ...extra,
-    };
-}
-
 function debounceFetch(fn) {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(fn, 300);
 }
-
-// ── Paint keep/remove regions ──
-
-state.paintMode = 'keep';
-state.painting = false;
-
-document.querySelectorAll('.paint-btn').forEach(b => {
-    b.onclick = () => {
-        state.paintMode = b.dataset.mode;
-        document.querySelectorAll('.paint-btn').forEach(pb => pb.classList.remove('active'));
-        b.classList.add('active');
-        // Style active button
-        document.querySelectorAll('.paint-btn').forEach(pb => {
-            pb.style.background = ''; pb.style.borderColor = '';
-        });
-        if (b.dataset.mode === 'keep') { b.style.background = '#186818'; b.style.borderColor = '#186818'; }
-        else if (b.dataset.mode === 'remove') { b.style.background = '#881818'; b.style.borderColor = '#881818'; }
-        else { b.style.background = '#555'; b.style.borderColor = '#555'; }
-    };
-});
-
-$('#brushSize').oninput = () => { $('#brushVal').textContent = $('#brushSize').value; };
-
-$('#btnClearPaint').onclick = async () => {
-    await fetch('/api/clear_paint', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ id: state.id })
-    });
-    fetchThreshold();
-};
-
-function getPaintCoords(e) {
-    const img = $('#previewPane img');
-    if (!img) return null;
-    const rect = img.getBoundingClientRect();
-    const x = Math.round((e.clientX - rect.left) / rect.width * 100);
-    const y = Math.round((e.clientY - rect.top) / rect.height * 100);
-    if (x < 0 || x > 100 || y < 0 || y > 100) return null;
-    return { x, y };
-}
-
-async function paintAt(e) {
-    if (state.step !== 1) return;
-    const coords = getPaintCoords(e);
-    if (!coords) return;
-
-    const r = await fetch('/api/paint', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            ...coords,
-            mode: state.paintMode,
-            brush: parseInt($('#brushSize').value),
-            ...getParams(),
-        })
-    });
-    const d = await r.json();
-    if (d.error) return;
-    showPreview(d.preview);
-    $('#fgStat').textContent = `Foreground: ${d.fg_pct}% of image`;
-}
-
-$('#previewPane').addEventListener('mousedown', (e) => {
-    if (state.step !== 1) return;
-    state.painting = true;
-    paintAt(e);
-});
-$('#previewPane').addEventListener('mousemove', (e) => {
-    if (!state.painting) return;
-    paintAt(e);
-});
-document.addEventListener('mouseup', () => { state.painting = false; });
-
-// ── SAM 2 Client-Side Segmentation ──
-
-const SAM_ENCODER_URL = 'https://storage.googleapis.com/lb-artifacts-testing-public/sam2/sam2_hiera_tiny.encoder.ort';
-const SAM_DECODER_URL = 'https://storage.googleapis.com/lb-artifacts-testing-public/sam2/sam2_hiera_tiny.decoder.onnx';
-
-let samEncoder = null, samDecoder = null, samEmbedding = null;
-let samPoints = [];
-let samImageW = 0, samImageH = 0;
-
-async function initSAM() {
-    if (samEncoder && samDecoder) {
-        // Already loaded, just re-encode if image changed
-        if (!samEmbedding) await encodeSAMImage();
-        renderSAMPreview();
-        return;
-    }
-
-    $('#samLoadSpinner').style.display = '';
-    $('#samStat').textContent = '';
-
-    try {
-        // Load onnxruntime-web if not loaded
-        if (!window.ort) {
-            await new Promise((resolve, reject) => {
-                const s = document.createElement('script');
-                s.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js';
-                s.onload = resolve;
-                s.onerror = reject;
-                document.head.appendChild(s);
-            });
-        }
-
-        ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
-
-        $('#samStat').textContent = 'Loading encoder model (~148MB)...';
-        samEncoder = await ort.InferenceSession.create(SAM_ENCODER_URL);
-
-        $('#samStat').textContent = 'Loading decoder model (~16MB)...';
-        samDecoder = await ort.InferenceSession.create(SAM_DECODER_URL);
-
-        $('#samStat').textContent = 'Encoding image...';
-        await encodeSAMImage();
-
-        $('#samLoadSpinner').style.display = 'none';
-        $('#samStat').textContent = 'Ready. Click on the image to segment.';
-    } catch (e) {
-        console.error('SAM init error:', e);
-        $('#samLoadSpinner').style.display = 'none';
-        $('#samStat').textContent = 'Error loading SAM: ' + e.message;
-    }
-}
-
-async function encodeSAMImage() {
-    const img = $('#previewPane img');
-    if (!img) return;
-
-    // Get original image dimensions
-    samImageW = img.naturalWidth;
-    samImageH = img.naturalHeight;
-
-    // Draw to 1024x1024 canvas
-    const canvas = document.createElement('canvas');
-    canvas.width = 1024;
-    canvas.height = 1024;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, 0, 0, 1024, 1024);
-    const imageData = ctx.getImageData(0, 0, 1024, 1024).data;
-
-    // Normalize to [-1, 1]
-    const input = new Float32Array(3 * 1024 * 1024);
-    for (let i = 0; i < 1024 * 1024; i++) {
-        input[i] = (imageData[i * 4] / 255.0) * 2 - 1;
-        input[i + 1024 * 1024] = (imageData[i * 4 + 1] / 255.0) * 2 - 1;
-        input[i + 2 * 1024 * 1024] = (imageData[i * 4 + 2] / 255.0) * 2 - 1;
-    }
-
-    const tensor = new ort.Tensor('float32', input, [1, 3, 1024, 1024]);
-    const results = await samEncoder.run({ image: tensor });
-    samEmbedding = results.image_embed;
-    samPoints = [];
-}
-
-async function runSAMDecoder() {
-    if (!samDecoder || !samEmbedding || samPoints.length === 0) return null;
-
-    const numPoints = samPoints.length;
-    const pointCoords = new Float32Array(numPoints * 2);
-    const pointLabels = new Float32Array(numPoints);
-
-    // Scale points to 1024x1024 space
-    const scaleX = 1024 / samImageW;
-    const scaleY = 1024 / samImageH;
-
-    for (let i = 0; i < numPoints; i++) {
-        pointCoords[i * 2] = samPoints[i].x * scaleX;
-        pointCoords[i * 2 + 1] = samPoints[i].y * scaleY;
-        pointLabels[i] = samPoints[i].label;
-    }
-
-    const inputs = {
-        image_embed: samEmbedding,
-        point_coords: new ort.Tensor('float32', pointCoords, [1, numPoints, 2]),
-        point_labels: new ort.Tensor('float32', pointLabels, [1, numPoints]),
-        mask_input: new ort.Tensor('float32', new Float32Array(1 * 1 * 256 * 256), [1, 1, 256, 256]),
-        has_mask_input: new ort.Tensor('float32', new Float32Array([0.0]), [1]),
-        high_res_feats_0: new ort.Tensor('float32', new Float32Array(1 * 32 * 256 * 256), [1, 32, 256, 256]),
-        high_res_feats_1: new ort.Tensor('float32', new Float32Array(1 * 64 * 128 * 128), [1, 64, 128, 128]),
-    };
-
-    const results = await samDecoder.run(inputs);
-    return results;
-}
-
-function renderSAMPreview() {
-    const pane = $('#previewPane');
-    // Ensure we have the base image + overlay canvas
-    let img = pane.querySelector('img');
-    let overlayCanvas = pane.querySelector('.sam-overlay');
-    if (!img) {
-        // Show original image
-        const sess_preview = state._lastPreview;
-        if (sess_preview) {
-            img = document.createElement('img');
-            img.src = sess_preview;
-            pane.innerHTML = '';
-            pane.appendChild(img);
-        }
-        return;
-    }
-
-    if (!overlayCanvas) {
-        overlayCanvas = document.createElement('canvas');
-        overlayCanvas.className = 'sam-overlay';
-        overlayCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;';
-        pane.appendChild(overlayCanvas);
-    }
-
-    // Size overlay to match image display size
-    const rect = img.getBoundingClientRect();
-    const paneRect = pane.getBoundingClientRect();
-    overlayCanvas.width = rect.width;
-    overlayCanvas.height = rect.height;
-    overlayCanvas.style.left = (rect.left - paneRect.left) + 'px';
-    overlayCanvas.style.top = (rect.top - paneRect.top) + 'px';
-    overlayCanvas.style.width = rect.width + 'px';
-    overlayCanvas.style.height = rect.height + 'px';
-
-    const ctx = overlayCanvas.getContext('2d');
-    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-
-    // Draw point markers
-    for (const pt of samPoints) {
-        const cx = pt.x / samImageW * rect.width;
-        const cy = pt.y / samImageH * rect.height;
-        ctx.beginPath();
-        ctx.arc(cx, cy, 5, 0, Math.PI * 2);
-        ctx.fillStyle = pt.label === 1 ? '#00ff00' : '#ff0000';
-        ctx.fill();
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-    }
-}
-
-async function renderSAMMask(results) {
-    if (!results) return;
-
-    const pane = $('#previewPane');
-    const img = pane.querySelector('img');
-    if (!img) return;
-
-    let overlayCanvas = pane.querySelector('.sam-overlay');
-    if (!overlayCanvas) {
-        overlayCanvas = document.createElement('canvas');
-        overlayCanvas.className = 'sam-overlay';
-        overlayCanvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;';
-        pane.appendChild(overlayCanvas);
-    }
-
-    const rect = img.getBoundingClientRect();
-    const paneRect = pane.getBoundingClientRect();
-    overlayCanvas.width = rect.width;
-    overlayCanvas.height = rect.height;
-    overlayCanvas.style.left = (rect.left - paneRect.left) + 'px';
-    overlayCanvas.style.top = (rect.top - paneRect.top) + 'px';
-    overlayCanvas.style.width = rect.width + 'px';
-    overlayCanvas.style.height = rect.height + 'px';
-
-    const ctx = overlayCanvas.getContext('2d');
-
-    // Get mask data (256x256)
-    const maskData = results.masks?.data || results.low_res_masks?.data;
-    if (!maskData) return;
-
-    // Render mask to a small canvas then scale
-    const maskCanvas = document.createElement('canvas');
-    maskCanvas.width = 256;
-    maskCanvas.height = 256;
-    const maskCtx = maskCanvas.getContext('2d');
-    const maskImgData = maskCtx.createImageData(256, 256);
-
-    // Use first mask (best)
-    for (let i = 0; i < 256 * 256; i++) {
-        const v = maskData[i]; // logit value
-        if (v > 0) {
-            maskImgData.data[i * 4] = 0;
-            maskImgData.data[i * 4 + 1] = 180;
-            maskImgData.data[i * 4 + 2] = 0;
-            maskImgData.data[i * 4 + 3] = 80;
-        } else {
-            maskImgData.data[i * 4] = 180;
-            maskImgData.data[i * 4 + 1] = 0;
-            maskImgData.data[i * 4 + 2] = 0;
-            maskImgData.data[i * 4 + 3] = 60;
-        }
-    }
-    maskCtx.putImageData(maskImgData, 0, 0);
-
-    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-    ctx.drawImage(maskCanvas, 0, 0, overlayCanvas.width, overlayCanvas.height);
-
-    // Draw points on top
-    for (const pt of samPoints) {
-        const cx = pt.x / samImageW * rect.width;
-        const cy = pt.y / samImageH * rect.height;
-        ctx.beginPath();
-        ctx.arc(cx, cy, 5, 0, Math.PI * 2);
-        ctx.fillStyle = pt.label === 1 ? '#00ff00' : '#ff0000';
-        ctx.fill();
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-    }
-
-    // Store mask for upload
-    state._samMaskData = maskData;
-    const fg = Array.from(maskData).filter(v => v > 0).length;
-    $('#samStat').textContent = `${samPoints.length} point(s), ${(fg / (256*256) * 100).toFixed(1)}% foreground`;
-}
-
-// Upload SAM mask to server before proceeding to contours
-async function uploadSAMMask() {
-    if (!state._samMaskData) return false;
-
-    // Render binary mask to canvas at image resolution
-    const canvas = document.createElement('canvas');
-    canvas.width = samImageW;
-    canvas.height = samImageH;
-    const ctx = canvas.getContext('2d');
-
-    // First render 256x256 binary mask
-    const mask256 = document.createElement('canvas');
-    mask256.width = 256;
-    mask256.height = 256;
-    const m256ctx = mask256.getContext('2d');
-    const imgData = m256ctx.createImageData(256, 256);
-    for (let i = 0; i < 256 * 256; i++) {
-        const v = state._samMaskData[i] > 0 ? 255 : 0;
-        imgData.data[i * 4] = v;
-        imgData.data[i * 4 + 1] = v;
-        imgData.data[i * 4 + 2] = v;
-        imgData.data[i * 4 + 3] = 255;
-    }
-    m256ctx.putImageData(imgData, 0, 0);
-
-    // Scale to full resolution
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(mask256, 0, 0, samImageW, samImageH);
-
-    // Export as PNG base64
-    const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
-    const buf = await blob.arrayBuffer();
-    const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-
-    const r = await fetch('/api/upload_mask', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ id: state.id, mask: b64 })
-    });
-    const d = await r.json();
-    return !d.error;
-}
-
-// SAM click handler
-$('#previewPane').addEventListener('click', async (e) => {
-    if (state.step !== 1 || state.method !== 'sam') return;
-    if (!samDecoder || !samEmbedding) return;
-
-    const img = $('#previewPane img');
-    if (!img) return;
-    const rect = img.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width * samImageW;
-    const y = (e.clientY - rect.top) / rect.height * samImageH;
-    if (x < 0 || x > samImageW || y < 0 || y > samImageH) return;
-
-    // Left click = keep (1), will use contextmenu for remove
-    samPoints.push({ x, y, label: 1 });
-    renderSAMPreview();
-
-    const results = await runSAMDecoder();
-    await renderSAMMask(results);
-});
-
-$('#previewPane').addEventListener('contextmenu', async (e) => {
-    if (state.step !== 1 || state.method !== 'sam') return;
-    if (!samDecoder || !samEmbedding) return;
-    e.preventDefault();
-
-    const img = $('#previewPane img');
-    if (!img) return;
-    const rect = img.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width * samImageW;
-    const y = (e.clientY - rect.top) / rect.height * samImageH;
-    if (x < 0 || x > samImageW || y < 0 || y > samImageH) return;
-
-    samPoints.push({ x, y, label: 0 });
-    renderSAMPreview();
-
-    const results = await runSAMDecoder();
-    await renderSAMMask(results);
-});
-
-$('#samUndo').onclick = async () => {
-    samPoints.pop();
-    if (samPoints.length > 0) {
-        const results = await runSAMDecoder();
-        await renderSAMMask(results);
-    } else {
-        // Clear overlay
-        const ov = $('#previewPane .sam-overlay');
-        if (ov) ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
-        state._samMaskData = null;
-        $('#samStat').textContent = 'Click on the image to segment.';
-    }
-};
-
-$('#samClear').onclick = () => {
-    samPoints = [];
-    const ov = $('#previewPane .sam-overlay');
-    if (ov) ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
-    state._samMaskData = null;
-    $('#samStat').textContent = 'Click on the image to segment.';
-};
 </script>
 </body>
 </html>'''

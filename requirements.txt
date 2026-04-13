@@ -3,4 +3,3 @@ gunicorn
 opencv-python-headless
 numpy
 scipy
-rembg[cpu]
