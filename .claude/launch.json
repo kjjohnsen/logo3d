@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "logo3d",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["app.py"],
+      "port": 8015,
+      "cwd": "."
+    }
+  ]
+}
