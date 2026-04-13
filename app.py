@@ -23,6 +23,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 # In-memory session store: {id: {img_bytes, filename, timestamp}}
+# Note: with multiple gunicorn workers, use --preload or -w 1 to share memory
 sessions = {}
 SESSION_TTL = 1800  # 30 minutes
 
@@ -88,15 +89,29 @@ def upscale_image(img):
     return img, scale
 
 
-def extract_mask_ai(img_orig):
-    """Use rembg (U2Net) to extract foreground mask. Works on original resolution."""
+AI_MODELS = ['u2net', 'isnet-general-use', 'silueta', 'u2netp', 'isnet-anime']
+
+
+def extract_mask_ai_raw(img_orig, model='u2net'):
+    """Use rembg to get the raw soft alpha mask (0-255). Cached per session+model."""
     if not HAS_REMBG:
         raise RuntimeError("rembg not installed")
+    from rembg import new_session
+    sess = new_session(model)
     pil_img = Image.fromarray(cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB))
-    result = rembg_remove(pil_img)
-    # result is RGBA — alpha channel is the mask
-    alpha = np.array(result)[:, :, 3]
-    _, mask = cv2.threshold(alpha, 127, 255, cv2.THRESH_BINARY)
+    result = rembg_remove(pil_img, session=sess)
+    return np.array(result)[:, :, 3]  # soft alpha 0-255
+
+
+def apply_ai_mask(raw_alpha, alpha_thresh=127, erode_px=None, dilate_px=None):
+    """Apply threshold + morphology to a raw soft alpha mask."""
+    _, mask = cv2.threshold(raw_alpha, int(alpha_thresh), 255, cv2.THRESH_BINARY)
+    if dilate_px and dilate_px > 0:
+        dk = np.ones((dilate_px * 2 + 1, dilate_px * 2 + 1), np.uint8)
+        mask = cv2.dilate(mask, dk, iterations=1)
+    if erode_px and erode_px > 0:
+        ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
+        mask = cv2.erode(mask, ek, iterations=1)
     return mask
 
 
@@ -207,6 +222,19 @@ def img_to_b64png(img):
     return base64.b64encode(buf).decode()
 
 
+def apply_manual_overrides(mask, sess, w, h):
+    """Apply manual keep/remove overrides to a mask."""
+    if 'manual_mask' not in sess:
+        return mask
+    mm = sess['manual_mask']
+    if mm.shape != (h, w):
+        return mask
+    result = mask.copy()
+    result[mm == 1] = 255  # forced keep
+    result[mm == 2] = 0    # forced remove
+    return result
+
+
 # ── Routes ──
 
 @app.route('/')
@@ -260,17 +288,17 @@ def api_threshold():
     erode_px = int(d.get('erode', -1))
     if erode_px < 0:
         erode_px = None
+    dilate_px = int(d.get('dilate', 0))
+    alpha_thresh = int(d.get('alpha_thresh', 127))
+    ai_model = d.get('ai_model', 'u2net')
 
     if method == 'ai':
-        # Cache AI mask per session to avoid recomputing
-        if 'ai_mask' not in sess:
-            sess['ai_mask'] = extract_mask_ai(img)
-        mask_small = sess['ai_mask']
-        # Apply optional erosion on top
-        if erode_px and erode_px > 0:
-            ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
-            mask_small = cv2.erode(mask_small, ek, iterations=1)
-        thresh_for_contours = mask_small
+        # Cache raw alpha per session+model
+        cache_key = f'ai_alpha_{ai_model}'
+        if cache_key not in sess:
+            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
+        raw_alpha = sess[cache_key]
+        mask_small = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
     else:
         img_up, scale = upscale_image(img)
         thresh = extract_mask(img_up, sensitivity, erode_px)
@@ -286,6 +314,92 @@ def api_threshold():
     overlay[removed] = (overlay[removed] * 0.3 + np.array([0, 0, 180]) * 0.7).astype(np.uint8)
 
     fg_pct = (mask_small > 0).sum() / (w * h) * 100
+
+    return jsonify(
+        preview=f'data:image/png;base64,{img_to_b64png(overlay)}',
+        fg_pct=round(fg_pct, 1),
+    )
+
+
+@app.route('/api/toggle_region', methods=['POST'])
+def api_toggle_region():
+    """Click a point to flood-fill toggle that region in the mask."""
+    d = request.json
+    sid = d.get('id')
+    if sid not in sessions:
+        return jsonify(error='Session expired'), 404
+
+    sess = sessions[sid]
+    sess['timestamp'] = time.time()
+    img = decode_image(sess['img_bytes'])
+    h, w = img.shape[:2]
+
+    # Get or create the manual overrides mask
+    if 'manual_mask' not in sess:
+        sess['manual_mask'] = np.zeros((h, w), dtype=np.uint8)
+
+    # Click position (0-100 percentage)
+    px = int(d.get('x', 50) * w / 100)
+    py = int(d.get('y', 50) * h / 100)
+    px = max(0, min(w - 1, px))
+    py = max(0, min(h - 1, py))
+
+    # Build current mask
+    method = d.get('method', 'color')
+    sensitivity = float(d.get('sensitivity', 1.0))
+    erode_px = int(d.get('erode', -1))
+    if erode_px < 0:
+        erode_px = None
+    dilate_px = int(d.get('dilate', 0))
+    alpha_thresh = int(d.get('alpha_thresh', 127))
+    ai_model = d.get('ai_model', 'u2net')
+
+    if method == 'ai':
+        cache_key = f'ai_alpha_{ai_model}'
+        if cache_key not in sess:
+            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
+        raw_alpha = sess[cache_key]
+        base_mask = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
+    else:
+        img_up, scale = upscale_image(img)
+        thresh = extract_mask(img_up, sensitivity, erode_px)
+        if scale > 1:
+            base_mask = cv2.resize(thresh, (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            base_mask = thresh
+
+    # Apply existing manual overrides
+    combined = base_mask.copy()
+    combined[sess['manual_mask'] == 1] = 255  # forced keep
+    combined[sess['manual_mask'] == 2] = 0    # forced remove
+
+    # Check what the clicked pixel currently is
+    is_fg = combined[py, px] > 0
+
+    # Flood fill on the base mask to find the connected region
+    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    if is_fg:
+        # Currently foreground — mark region as remove
+        cv2.floodFill(combined, flood_mask, (px, py), 0, 10, 10, cv2.FLOODFILL_MASK_ONLY)
+        region = flood_mask[1:-1, 1:-1] > 0
+        sess['manual_mask'][region] = 2  # force remove
+    else:
+        # Currently background — mark region as keep
+        inv = 255 - combined
+        cv2.floodFill(inv, flood_mask, (px, py), 0, 10, 10, cv2.FLOODFILL_MASK_ONLY)
+        region = flood_mask[1:-1, 1:-1] > 0
+        sess['manual_mask'][region] = 1  # force keep
+
+    # Rebuild final mask with overrides
+    final = base_mask.copy()
+    final[sess['manual_mask'] == 1] = 255
+    final[sess['manual_mask'] == 2] = 0
+
+    # Overlay
+    overlay = img.copy()
+    removed = final == 0
+    overlay[removed] = (overlay[removed] * 0.3 + np.array([0, 0, 180]) * 0.7).astype(np.uint8)
+    fg_pct = (final > 0).sum() / (w * h) * 100
 
     return jsonify(
         preview=f'data:image/png;base64,{img_to_b64png(overlay)}',
@@ -312,13 +426,17 @@ def api_contours():
         erode_px = None
     budget = int(d.get('budget', 600))
 
+    dilate_px = int(d.get('dilate', 0))
+    alpha_thresh = int(d.get('alpha_thresh', 127))
+    ai_model = d.get('ai_model', 'u2net')
+
     if method == 'ai':
-        if 'ai_mask' not in sess:
-            sess['ai_mask'] = extract_mask_ai(img)
-        thresh = sess['ai_mask'].copy()
-        if erode_px and erode_px > 0:
-            ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
-            thresh = cv2.erode(thresh, ek, iterations=1)
+        cache_key = f'ai_alpha_{ai_model}'
+        if cache_key not in sess:
+            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
+        raw_alpha = sess[cache_key]
+        thresh = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
+        thresh = apply_manual_overrides(thresh, sess, w, h)
         scale = 1
     else:
         img_up, scale = upscale_image(img)
@@ -368,13 +486,17 @@ def api_generate():
     budget = int(d.get('budget', 600))
     depth_pct = float(d.get('depth_pct', 8))
 
+    dilate_px = int(d.get('dilate', 0))
+    alpha_thresh = int(d.get('alpha_thresh', 127))
+    ai_model = d.get('ai_model', 'u2net')
+
     if method == 'ai':
-        if 'ai_mask' not in sess:
-            sess['ai_mask'] = extract_mask_ai(img)
-        thresh = sess['ai_mask'].copy()
-        if erode_px and erode_px > 0:
-            ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
-            thresh = cv2.erode(thresh, ek, iterations=1)
+        cache_key = f'ai_alpha_{ai_model}'
+        if cache_key not in sess:
+            sess[cache_key] = extract_mask_ai_raw(img, model=ai_model)
+        raw_alpha = sess[cache_key]
+        thresh = apply_ai_mask(raw_alpha, alpha_thresh, erode_px, dilate_px)
+        thresh = apply_manual_overrides(thresh, sess, w, h)
         scale = 1
     else:
         img_up, scale = upscale_image(img)
@@ -479,6 +601,9 @@ input[type=range] { width: 100%; accent-color: #4a9; }
               border: 1px solid #444; transition: all 0.2s; }
 .method-btn.active { background: #2a6; color: #fff; border-color: #2a6; }
 
+.select-input { width: 100%; padding: 6px 8px; background: #222; color: #ddd; border: 1px solid #444;
+                border-radius: 4px; font-size: 0.85rem; margin-bottom: 8px; }
+
 /* Mobile */
 @media (max-width: 768px) {
     .main { flex-direction: column; height: auto; }
@@ -530,8 +655,23 @@ input[type=range] { width: 100%; accent-color: #4a9; }
                 <label class="slider-label">Sensitivity <span id="sensVal">1.0</span></label>
                 <input type="range" id="sensitivity" min="0.3" max="2.0" step="0.05" value="1.0">
             </div>
+            <div id="aiControls" style="display:none">
+                <label class="slider-label">Model</label>
+                <select id="aiModel" class="select-input">
+                    <option value="u2net">U2Net (general)</option>
+                    <option value="isnet-general-use">ISNet (general)</option>
+                    <option value="silueta">Silueta (fast)</option>
+                    <option value="u2netp">U2Net-P (light)</option>
+                    <option value="isnet-anime">ISNet (anime)</option>
+                </select>
+                <label class="slider-label">Alpha Cutoff <span id="alphaVal">127</span></label>
+                <input type="range" id="alphaThresh" min="10" max="245" step="5" value="127">
+                <label class="slider-label">Dilate <span id="dilateVal">0</span></label>
+                <input type="range" id="dilate" min="0" max="20" step="1" value="0">
+            </div>
             <label class="slider-label">Erosion <span id="erodeVal">auto</span></label>
             <input type="range" id="erode" min="-1" max="20" step="1" value="-1">
+            <p class="hint" id="clickHint" style="display:none;margin-top:4px;color:#6b8">Click on the preview to toggle keep/remove regions</p>
             <div class="stat" id="fgStat"></div>
             <div class="spinner" id="threshSpinner">Updating...</div>
             <div class="btn-row">
@@ -644,6 +784,8 @@ function switchMethod(m) {
     document.querySelectorAll('.method-btn').forEach(b =>
         b.classList.toggle('active', b.dataset.method === m));
     $('#colorControls').style.display = m === 'color' ? '' : 'none';
+    $('#aiControls').style.display = m === 'ai' ? '' : 'none';
+    $('#clickHint').style.display = m === 'ai' ? '' : 'none';
     fetchThreshold();
 }
 
@@ -658,6 +800,19 @@ $('#erode').oninput = () => {
     $('#erodeVal').textContent = v < 0 ? 'auto' : v + 'px';
     debounceFetch(fetchThreshold);
 };
+$('#alphaThresh').oninput = () => {
+    $('#alphaVal').textContent = $('#alphaThresh').value;
+    debounceFetch(fetchThreshold);
+};
+$('#dilate').oninput = () => {
+    $('#dilateVal').textContent = $('#dilate').value;
+    debounceFetch(fetchThreshold);
+};
+$('#aiModel').onchange = () => {
+    $('#threshSpinner').classList.add('show');
+    $('#threshSpinner').textContent = 'Loading model...';
+    fetchThreshold();
+};
 
 async function fetchThreshold() {
     $('#threshSpinner').classList.add('show');
@@ -668,10 +823,14 @@ async function fetchThreshold() {
             method: state.method,
             sensitivity: parseFloat($('#sensitivity').value),
             erode: parseInt($('#erode').value),
+            dilate: parseInt($('#dilate').value || 0),
+            alpha_thresh: parseInt($('#alphaThresh').value || 127),
+            ai_model: $('#aiModel').value,
         })
     });
     const d = await r.json();
     $('#threshSpinner').classList.remove('show');
+    $('#threshSpinner').textContent = 'Updating...';
     if (d.error) return;
     showPreview(d.preview);
     $('#fgStat').textContent = `Foreground: ${d.fg_pct}% of image`;
@@ -691,13 +850,7 @@ async function fetchContours() {
     $('#contourSpinner').classList.add('show');
     const r = await fetch('/api/contours', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            id: state.id,
-            method: state.method,
-            sensitivity: parseFloat($('#sensitivity').value),
-            erode: parseInt($('#erode').value),
-            budget: parseInt($('#budget').value),
-        })
+        body: JSON.stringify(getParams({budget: parseInt($('#budget').value)}))
     });
     const d = await r.json();
     $('#contourSpinner').classList.remove('show');
@@ -722,14 +875,10 @@ async function fetchGenerate() {
     $('#btnDownload').disabled = true;
     const r = await fetch('/api/generate', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            id: state.id,
-            method: state.method,
-            sensitivity: parseFloat($('#sensitivity').value),
-            erode: parseInt($('#erode').value),
+        body: JSON.stringify(getParams({
             budget: parseInt($('#budget').value),
             depth_pct: parseFloat($('#depth').value),
-        })
+        }))
     });
     const d = await r.json();
     $('#genSpinner').classList.remove('show');
@@ -756,10 +905,45 @@ $('#btnStartOver').onclick = () => {
 
 // ── Utility ──
 
+function getParams(extra = {}) {
+    return {
+        id: state.id,
+        method: state.method,
+        sensitivity: parseFloat($('#sensitivity').value),
+        erode: parseInt($('#erode').value),
+        dilate: parseInt($('#dilate').value || 0),
+        alpha_thresh: parseInt($('#alphaThresh').value || 127),
+        ai_model: $('#aiModel').value,
+        ...extra,
+    };
+}
+
 function debounceFetch(fn) {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(fn, 300);
 }
+
+// ── Click-to-toggle mask regions ──
+$('#previewPane').addEventListener('click', async (e) => {
+    if (state.step !== 1) return;
+    const img = $('#previewPane img');
+    if (!img) return;
+
+    // Get click coords relative to actual image
+    const rect = img.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) / rect.width * 100);
+    const y = Math.round((e.clientY - rect.top) / rect.height * 100);
+    if (x < 0 || x > 100 || y < 0 || y > 100) return;
+
+    const r = await fetch('/api/toggle_region', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ id: state.id, x, y, ...getParams() })
+    });
+    const d = await r.json();
+    if (d.error) return;
+    showPreview(d.preview);
+    $('#fgStat').textContent = `Foreground: ${d.fg_pct}% of image`;
+});
 </script>
 </body>
 </html>'''
