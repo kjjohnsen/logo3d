@@ -8,6 +8,14 @@ import json
 import base64
 import os
 import uuid
+from PIL import Image
+import io
+
+try:
+    from rembg import remove as rembg_remove
+    HAS_REMBG = True
+except ImportError:
+    HAS_REMBG = False
 import time
 import threading
 
@@ -78,6 +86,18 @@ def upscale_image(img):
     if scale > 1:
         img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
     return img, scale
+
+
+def extract_mask_ai(img_orig):
+    """Use rembg (U2Net) to extract foreground mask. Works on original resolution."""
+    if not HAS_REMBG:
+        raise RuntimeError("rembg not installed")
+    pil_img = Image.fromarray(cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB))
+    result = rembg_remove(pil_img)
+    # result is RGBA — alpha channel is the mask
+    alpha = np.array(result)[:, :, 3]
+    _, mask = cv2.threshold(alpha, 127, 255, cv2.THRESH_BINARY)
+    return mask
 
 
 def extract_mask(img_up, sensitivity=1.0, erode_px=None):
@@ -235,19 +255,30 @@ def api_threshold():
     img = decode_image(sess['img_bytes'])
     h, w = img.shape[:2]
 
-    img_up, scale = upscale_image(img)
+    method = d.get('method', 'color')
     sensitivity = float(d.get('sensitivity', 1.0))
     erode_px = int(d.get('erode', -1))
     if erode_px < 0:
         erode_px = None
 
-    thresh = extract_mask(img_up, sensitivity, erode_px)
-
-    # Downscale mask for preview
-    if scale > 1:
-        mask_small = cv2.resize(thresh, (w, h), interpolation=cv2.INTER_NEAREST)
+    if method == 'ai':
+        # Cache AI mask per session to avoid recomputing
+        if 'ai_mask' not in sess:
+            sess['ai_mask'] = extract_mask_ai(img)
+        mask_small = sess['ai_mask']
+        # Apply optional erosion on top
+        if erode_px and erode_px > 0:
+            ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
+            mask_small = cv2.erode(mask_small, ek, iterations=1)
+        thresh_for_contours = mask_small
     else:
-        mask_small = thresh
+        img_up, scale = upscale_image(img)
+        thresh = extract_mask(img_up, sensitivity, erode_px)
+        if scale > 1:
+            mask_small = cv2.resize(thresh, (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            mask_small = thresh
+        thresh_for_contours = thresh
 
     # Overlay: red tint on removed areas (where mask is 0)
     overlay = img.copy()
@@ -274,14 +305,25 @@ def api_contours():
     img = decode_image(sess['img_bytes'])
     h, w = img.shape[:2]
 
-    img_up, scale = upscale_image(img)
+    method = d.get('method', 'color')
     sensitivity = float(d.get('sensitivity', 1.0))
     erode_px = int(d.get('erode', -1))
     if erode_px < 0:
         erode_px = None
     budget = int(d.get('budget', 600))
 
-    thresh = extract_mask(img_up, sensitivity, erode_px)
+    if method == 'ai':
+        if 'ai_mask' not in sess:
+            sess['ai_mask'] = extract_mask_ai(img)
+        thresh = sess['ai_mask'].copy()
+        if erode_px and erode_px > 0:
+            ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
+            thresh = cv2.erode(thresh, ek, iterations=1)
+        scale = 1
+    else:
+        img_up, scale = upscale_image(img)
+        thresh = extract_mask(img_up, sensitivity, erode_px)
+
     simplified, hier = extract_contours(thresh, scale, budget)
 
     if not simplified:
@@ -318,7 +360,7 @@ def api_generate():
     img = decode_image(sess['img_bytes'])
     h, w = img.shape[:2]
 
-    img_up, scale = upscale_image(img)
+    method = d.get('method', 'color')
     sensitivity = float(d.get('sensitivity', 1.0))
     erode_px = int(d.get('erode', -1))
     if erode_px < 0:
@@ -326,7 +368,18 @@ def api_generate():
     budget = int(d.get('budget', 600))
     depth_pct = float(d.get('depth_pct', 8))
 
-    thresh = extract_mask(img_up, sensitivity, erode_px)
+    if method == 'ai':
+        if 'ai_mask' not in sess:
+            sess['ai_mask'] = extract_mask_ai(img)
+        thresh = sess['ai_mask'].copy()
+        if erode_px and erode_px > 0:
+            ek = np.ones((erode_px * 2 + 1, erode_px * 2 + 1), np.uint8)
+            thresh = cv2.erode(thresh, ek, iterations=1)
+        scale = 1
+    else:
+        img_up, scale = upscale_image(img)
+        thresh = extract_mask(img_up, sensitivity, erode_px)
+
     simplified, hier = extract_contours(thresh, scale, budget)
     if not simplified:
         return jsonify(error='No contours found'), 400
@@ -421,6 +474,11 @@ input[type=range] { width: 100%; accent-color: #4a9; }
 .spinner { display: none; text-align: center; color: #888; font-size: 0.85rem; padding: 8px; }
 .spinner.show { display: block; }
 
+.method-toggle { display: flex; gap: 4px; margin-bottom: 4px; }
+.method-btn { flex: 1; padding: 6px 8px; font-size: 0.8rem; background: #333; color: #aaa;
+              border: 1px solid #444; transition: all 0.2s; }
+.method-btn.active { background: #2a6; color: #fff; border-color: #2a6; }
+
 /* Mobile */
 @media (max-width: 768px) {
     .main { flex-direction: column; height: auto; }
@@ -464,8 +522,14 @@ input[type=range] { width: 100%; accent-color: #4a9; }
         <div class="panel" id="step1">
             <h2>2. Background Removal</h2>
             <p class="hint">Red = removed area. Adjust until only the logo is white.</p>
-            <label class="slider-label">Sensitivity <span id="sensVal">1.0</span></label>
-            <input type="range" id="sensitivity" min="0.3" max="2.0" step="0.05" value="1.0">
+            <div class="method-toggle">
+                <button class="btn method-btn active" data-method="color" id="methodColor">Color Distance</button>
+                <button class="btn method-btn" data-method="ai" id="methodAI">AI (U2Net) &#x2728;</button>
+            </div>
+            <div id="colorControls">
+                <label class="slider-label">Sensitivity <span id="sensVal">1.0</span></label>
+                <input type="range" id="sensitivity" min="0.3" max="2.0" step="0.05" value="1.0">
+            </div>
             <label class="slider-label">Erosion <span id="erodeVal">auto</span></label>
             <input type="range" id="erode" min="-1" max="20" step="1" value="-1">
             <div class="stat" id="fgStat"></div>
@@ -505,7 +569,7 @@ input[type=range] { width: 100%; accent-color: #4a9; }
 
 <script>
 const $ = s => document.querySelector(s);
-const state = { id: null, step: 0 };
+const state = { id: null, step: 0, method: 'color' };
 let debounceTimer = null;
 
 // ── Step management ──
@@ -570,6 +634,19 @@ function showViewer(html) {
     $('#btnDownload').disabled = false;
 }
 
+// ── Method toggle ──
+
+$('#methodColor').onclick = () => switchMethod('color');
+$('#methodAI').onclick = () => switchMethod('ai');
+
+function switchMethod(m) {
+    state.method = m;
+    document.querySelectorAll('.method-btn').forEach(b =>
+        b.classList.toggle('active', b.dataset.method === m));
+    $('#colorControls').style.display = m === 'color' ? '' : 'none';
+    fetchThreshold();
+}
+
 // ── Threshold ──
 
 $('#sensitivity').oninput = () => {
@@ -588,6 +665,7 @@ async function fetchThreshold() {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             id: state.id,
+            method: state.method,
             sensitivity: parseFloat($('#sensitivity').value),
             erode: parseInt($('#erode').value),
         })
@@ -615,6 +693,7 @@ async function fetchContours() {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             id: state.id,
+            method: state.method,
             sensitivity: parseFloat($('#sensitivity').value),
             erode: parseInt($('#erode').value),
             budget: parseInt($('#budget').value),
@@ -645,6 +724,7 @@ async function fetchGenerate() {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             id: state.id,
+            method: state.method,
             sensitivity: parseFloat($('#sensitivity').value),
             erode: parseInt($('#erode').value),
             budget: parseInt($('#budget').value),
